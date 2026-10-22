@@ -4,6 +4,22 @@ import * as ig from "./instagram.js";
 import { pickRule, pickPublicReply } from "./match.js";
 
 const MAX_MEDIA_PER_POLL = 10; // "모든 게시물" 규칙일 때 확인할 최근 게시물 수
+const MAX_PEOPLE_PER_RUN = 8;   // 한 번 실행에 답장 확인할 최대 인원 (요청 한도 보호)
+const GATE_DAYS = 7;            // 팔로우 확인 대기 기간
+const MAX_NUDGES = 3;           // "아직 팔로우 안 됨" 안내 최대 횟수
+
+export const DEFAULT_FOLLOW_PROMPT =
+  "댓글 고마워요! 🙌 팔로우하고 이 메시지에 '완료'라고 답장 주시면 바로 보내드릴게요.";
+export const DEFAULT_NOT_FOLLOWING =
+  "아직 팔로우가 확인되지 않아요 🥲 팔로우하고 다시 답장 주시면 바로 보내드릴게요!";
+
+// 실행마다 요청 한도(무료 50개) 안에서 쓰도록 여유 있게 잡음
+export function withBudget(env, n = 45) {
+  return { ...env, _budget: { left: n } };
+}
+function budgetLeft(env) {
+  return env._budget ? env._budget.left : Infinity;
+}
 
 export async function getRules(env, igUserId) {
   const { results } = await env.DB.prepare(
@@ -12,7 +28,7 @@ export async function getRules(env, igUserId) {
   return results;
 }
 
-// 댓글 1개 처리. 반환: "sent" | "failed" | "no-match" | "duplicate" | "self"
+// 댓글 1개 처리. 반환: "sent" | "awaiting" | "failed" | "no-match" | "duplicate" | "self" | "deferred"
 export async function handleComment(env, account, rules, c, source) {
   const commenterId = c.from?.id ? String(c.from.id) : null;
   const commenterName = c.from?.username || c.username || "";
@@ -24,6 +40,9 @@ export async function handleComment(env, account, rules, c, source) {
   const rule = pickRule(rules, { mediaId: c.mediaId, text: c.text, commentTime });
   if (!rule) return "no-match";
 
+  // 이번 실행의 요청 한도가 거의 다 찼으면 선점하지 않고 다음 실행으로 넘김
+  if (budgetLeft(env) < 3) return "deferred";
+
   // 중복 방지: comment_id 선점. 이미 있으면(폴링·웹훅 동시 수신 등) 건너뜀
   const claim = await env.DB.prepare(
     `INSERT OR IGNORE INTO logs
@@ -32,10 +51,18 @@ export async function handleComment(env, account, rules, c, source) {
   ).bind(c.id, account.ig_user_id, rule.id, c.mediaId, commenterId, commenterName, c.text, source, ig.now()).run();
   if (!claim.meta.changes) return "duplicate";
 
-  let status = "sent";
+  const gated = !!rule.follow_required;
+  let status = gated ? "awaiting" : "sent";
   let error = null;
   try {
-    await ig.sendPrivateReply(env, account.access_token, account.ig_user_id, c.id, rule.dm_message);
+    const text = gated ? rule.follow_prompt || DEFAULT_FOLLOW_PROMPT : rule.dm_message;
+    await ig.sendPrivateReply(env, account.access_token, account.ig_user_id, c.id, text);
+    if (gated) {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO follow_gates (comment_id, ig_user_id, rule_id, igsid, username, status, last_checked, created_at)
+         VALUES (?, ?, ?, ?, ?, 'awaiting', ?, ?)`
+      ).bind(c.id, account.ig_user_id, rule.id, commenterId, commenterName, ig.now(), ig.now()).run();
+    }
   } catch (e) {
     status = "failed";
     error = e.message;
@@ -94,8 +121,136 @@ export async function pollAccount(env, account) {
     for (const c of comments) {
       result.checked++;
       const r = await handleComment(env, account, rules, { ...c, mediaId }, "poll");
-      if (r === "sent") result.sent++;
+      if (r === "sent" || r === "awaiting") result.sent++;
       if (r === "failed") result.failed++;
+      if (r === "deferred") return { ...result, deferred: true };
+    }
+    if (budgetLeft(env) < 3) return { ...result, deferred: true };
+  }
+  return result;
+}
+
+// ---------- 팔로우 확인 (답장 감지 → 팔로우 확인 → 링크 발송) ----------
+
+export async function pollRepliesAll(env) {
+  const { results: accounts } = await env.DB.prepare("SELECT * FROM accounts").all();
+  const summary = [];
+  for (const account of accounts) {
+    try {
+      summary.push(await pollReplies(env, account));
+    } catch (e) {
+      summary.push({ account: account.username, error: e.message });
+    }
+  }
+  return summary;
+}
+
+export async function pollReplies(env, account) {
+  const result = { account: account.username, waiting: 0, replied: 0, unlocked: 0, nudged: 0 };
+
+  // 7일 지난 대기는 만료
+  await env.DB.prepare(
+    "UPDATE follow_gates SET status='expired' WHERE ig_user_id=? AND status='awaiting' AND created_at < ?"
+  ).bind(account.ig_user_id, ig.now() - GATE_DAYS * 86400).run();
+
+  const { results: gates } = await env.DB.prepare(
+    `SELECT g.*, r.dm_message, r.not_following_msg FROM follow_gates g
+     JOIN rules r ON r.id = g.rule_id
+     WHERE g.ig_user_id = ? AND g.status = 'awaiting' ORDER BY g.last_checked ASC`
+  ).bind(account.ig_user_id).all();
+  result.waiting = gates.length;
+  if (!gates.length) return result;
+
+  // 사람별로 묶기 (한 사람이 여러 게시물에 댓글 단 경우)
+  const byPerson = new Map();
+  for (const g of gates) {
+    const key = g.igsid || "@" + g.username;
+    if (!byPerson.has(key)) byPerson.set(key, []);
+    byPerson.get(key).push(g);
+  }
+
+  // 대화 목록 한 번에 받아서 "누구와의 대화가 언제 갱신됐는지" 파악
+  const convs = await ig.listConversations(env, account.access_token);
+  const hasParticipants = convs.some((c) => c.participants?.data?.length);
+  const convByPerson = new Map();
+  for (const c of convs) {
+    for (const p of c.participants?.data || []) {
+      if (String(p.id) === account.ig_user_id || p.username === account.username) continue;
+      const conv = { id: c.id, updated: ig.toUnix(c.updated_time) };
+      if (p.id) convByPerson.set(String(p.id), conv);
+      if (p.username) convByPerson.set("@" + p.username, conv);
+    }
+  }
+
+  let handled = 0;
+  for (const [key, list] of byPerson) {
+    if (handled >= MAX_PEOPLE_PER_RUN || budgetLeft(env) < 6) break;
+    const g0 = list[0];
+    const since = Math.min(...list.map((g) => g.last_checked));
+
+    let conv = convByPerson.get(g0.igsid) || convByPerson.get("@" + g0.username);
+    if (!conv && !hasParticipants && g0.igsid) {
+      handled++;
+      const found = await ig.findConversation(env, account.access_token, g0.igsid);
+      if (found) conv = { id: found.id, updated: ig.toUnix(found.updated_time) };
+    }
+    if (!conv) continue;                                 // 아직 답장 없음
+    if (conv.updated && conv.updated <= since) continue;  // 그 뒤로 새 메시지 없음
+    handled++;
+
+    // 새 메시지 중 상대가 보낸 게 있는지
+    const msgs = (await ig.listMessages(env, account.access_token, conv.id))
+      .filter((m) => !m.created_time || ig.toUnix(m.created_time) > since)
+      .slice(0, 3);
+    let replied = null;
+    for (const m of msgs) {
+      const d = await ig.getMessage(env, account.access_token, m.id);
+      const fromMe = String(d.from?.id) === account.ig_user_id || d.from?.username === account.username;
+      if (!fromMe && ig.toUnix(d.created_time) > since) { replied = d; break; }
+    }
+
+    const checkedAt = ig.now();
+    const ids = list.map((g) => g.comment_id);
+    const marks = ids.map(() => "?").join(",");
+    await env.DB.prepare(`UPDATE follow_gates SET last_checked = ? WHERE comment_id IN (${marks})`)
+      .bind(checkedAt, ...ids).run();
+    if (!replied) continue;
+    result.replied++;
+
+    const igsid = String(replied.from?.id || g0.igsid);
+    const profile = await ig.getFollowStatus(env, account.access_token, igsid);
+
+    if (profile.is_user_follow_business) {
+      // 팔로우 확인 → 규칙별 링크 DM (같은 규칙은 한 번만)
+      const sentRules = new Set();
+      for (const g of list) {
+        let status = "sent", error = null;
+        if (!sentRules.has(g.rule_id)) {
+          try {
+            await ig.sendDirect(env, account.access_token, account.ig_user_id, igsid, g.dm_message);
+            sentRules.add(g.rule_id);
+            result.unlocked++;
+          } catch (e) { status = "failed"; error = e.message; }
+        }
+        await env.DB.batch([
+          env.DB.prepare("UPDATE follow_gates SET status='done', igsid=? WHERE comment_id=?").bind(igsid, g.comment_id),
+          env.DB.prepare("UPDATE logs SET status=?, error=? WHERE comment_id=?").bind(status, error, g.comment_id),
+        ]);
+      }
+    } else {
+      // 아직 팔로우 안 함 → 안내 (최대 MAX_NUDGES 번)
+      const nudges = Math.max(...list.map((g) => g.nudges));
+      if (nudges < MAX_NUDGES) {
+        try {
+          await ig.sendDirect(env, account.access_token, account.ig_user_id, igsid, g0.not_following_msg || DEFAULT_NOT_FOLLOWING);
+          result.nudged++;
+        } catch (e) { /* 다음 답장 때 다시 시도 */ }
+      }
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE follow_gates SET nudges = nudges + 1, igsid=? WHERE comment_id IN (${marks})`).bind(igsid, ...ids),
+        env.DB.prepare(`UPDATE logs SET error = ? WHERE comment_id IN (${marks})`)
+          .bind(`답장했지만 아직 팔로우 안 함 (${nudges + 1}회)`, ...ids),
+      ]);
     }
   }
   return result;

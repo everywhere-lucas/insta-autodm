@@ -10,7 +10,16 @@ export class IgError extends Error {
   }
 }
 
-async function igFetch(url, init = {}) {
+// 무료 플랜은 실행 1번당 외부 요청 50개 제한 → env._budget 으로 남은 개수 관리
+export class BudgetError extends Error {}
+function spend(env) {
+  if (!env?._budget) return;
+  if (env._budget.left <= 0) throw new BudgetError("이번 실행의 요청 한도 소진 — 다음 실행에서 이어서 처리");
+  env._budget.left--;
+}
+
+async function igFetch(url, init = {}, env) {
+  spend(env);
   const res = await fetch(url, init);
   const text = await res.text();
   let body;
@@ -92,12 +101,12 @@ export async function refreshToken(token) {
 // ---------- 읽기 ----------
 
 export function getMe(env, token) {
-  return igFetch(`${GRAPH}/${v(env)}/me?fields=user_id,username`, auth(token));
+  return igFetch(`${GRAPH}/${v(env)}/me?fields=user_id,username`, auth(token), env);
 }
 
 export async function listMedia(env, token, limit = 24) {
   const fields = "id,caption,media_type,media_product_type,thumbnail_url,media_url,permalink,timestamp";
-  const r = await igFetch(`${GRAPH}/${v(env)}/me/media?fields=${fields}&limit=${limit}`, auth(token));
+  const r = await igFetch(`${GRAPH}/${v(env)}/me/media?fields=${fields}&limit=${limit}`, auth(token), env);
   return r.data || [];
 }
 
@@ -105,7 +114,7 @@ export async function listComments(env, token, mediaId, limit = 50) {
   const fields = "id,text,timestamp,username,from";
   const r = await igFetch(
     `${GRAPH}/${v(env)}/${mediaId}/comments?fields=${fields}&limit=${limit}`,
-    auth(token)
+    auth(token), env
   );
   return r.data || [];
 }
@@ -118,7 +127,7 @@ export function sendPrivateReply(env, token, igUserId, commentId, text) {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ recipient: { comment_id: commentId }, message: { text } }),
-  });
+  }, env);
 }
 
 // 댓글에 공개 답글
@@ -127,7 +136,60 @@ export function replyToComment(env, token, commentId, text) {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ message: text }),
-  });
+  }, env);
+}
+
+// ---------- 팔로우 확인용 (대화) ----------
+
+// 최근 대화 목록. participants 를 같이 받아 "누구와의 대화인지" 한 번에 파악
+export async function listConversations(env, token) {
+  const r = await igFetch(
+    `${GRAPH}/${v(env)}/me/conversations?platform=instagram&fields=participants,updated_time&limit=50`,
+    auth(token), env
+  );
+  return r.data || [];
+}
+
+// 특정 사람과의 대화 찾기 (participants 가 안 올 때 대비)
+export async function findConversation(env, token, igsid) {
+  const r = await igFetch(
+    `${GRAPH}/${v(env)}/me/conversations?platform=instagram&user_id=${igsid}&fields=updated_time`,
+    auth(token), env
+  );
+  return r.data?.[0] || null;
+}
+
+// 대화 안의 메시지 id 목록 (최신순)
+export async function listMessages(env, token, conversationId) {
+  const r = await igFetch(`${GRAPH}/${v(env)}/${conversationId}?fields=messages`, auth(token), env);
+  return r.messages?.data || [];
+}
+
+export function getMessage(env, token, messageId) {
+  return igFetch(`${GRAPH}/${v(env)}/${messageId}?fields=id,created_time,from,message`, auth(token), env);
+}
+
+// 상대가 나를 팔로우하는지 (상대가 나에게 메시지를 보낸 뒤에만 조회 가능)
+export function getFollowStatus(env, token, igsid) {
+  return igFetch(`${GRAPH}/${v(env)}/${igsid}?fields=username,is_user_follow_business`, auth(token), env);
+}
+
+// 일반 DM (상대가 답장한 뒤 24시간 안에만 가능)
+export function sendDirect(env, token, igUserId, igsid, text) {
+  return igFetch(`${GRAPH}/${v(env)}/${igUserId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ recipient: { id: igsid }, message: { text } }),
+  }, env);
+}
+
+// 인스타 시간값은 unix 초 또는 ISO 문자열 둘 다 옴
+export function toUnix(t) {
+  if (t == null) return 0;
+  if (typeof t === "number") return t > 1e12 ? Math.floor(t / 1000) : t;
+  if (/^\d+$/.test(t)) return toUnix(Number(t));
+  const ms = Date.parse(String(t).replace(/\+0000$/, "Z"));
+  return Number.isNaN(ms) ? 0 : Math.floor(ms / 1000);
 }
 
 // 웹훅 구독 (Advanced Access 승인 후에만 실제 알림이 옴)
@@ -135,7 +197,7 @@ export function subscribeWebhooks(env, token) {
   return igFetch(`${GRAPH}/${v(env)}/me/subscribed_apps?subscribed_fields=comments`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
-  });
+  }, env);
 }
 
 // ---------- 유틸 ----------

@@ -67,7 +67,11 @@ h2{font-size:16px;font-weight:800;margin:0}
 .log{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:start;padding:10px 0;border-top:1px solid var(--line);font-size:14px}
 .log:first-of-type{border-top:0}
 .st{font-size:11px;font-weight:700;padding:3px 7px;border-radius:6px;color:#fff}
-.st.sent{background:var(--ok)}.st.failed{background:var(--bad)}.st.pending{background:var(--warn)}
+.st.sent{background:var(--ok)}.st.failed{background:var(--bad)}.st.pending{background:var(--warn)}.st.awaiting{background:var(--blue)}
+.tag{font-size:11px;font-weight:700;padding:2px 7px;border-radius:6px;background:var(--blue);color:#fff}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding:12px 14px;border:1px solid var(--line);border-radius:12px}
+.toggle-row b{font-size:14px}
+.gate{border-left:3px solid var(--neon);padding-left:12px;margin-top:4px}
 .err{color:var(--bad);font-size:12px;margin-top:2px;word-break:break-all}
 dialog{border:0;border-radius:18px;padding:0;width:min(560px,calc(100vw - 24px));background:var(--card);color:var(--ink)}
 dialog::backdrop{background:rgba(5,10,30,.5)}
@@ -156,7 +160,19 @@ textarea{min-height:84px;resize:vertical}
   </div>
   <div class="hint">대소문자·띄어쓰기·이모지는 무시해요. "포함되면"은 '정보 주세요🙏'도 '정보'로 잡아요.</div>
 
-  <label>보낼 DM <span class="muted" id="dm-count">0 / 1000</span></label>
+  <div class="toggle-row">
+    <div><b>팔로우한 사람에게만 보내기</b><div class="hint" style="margin:2px 0 0">먼저 팔로우+답장을 요청하고, 팔로우가 확인되면 아래 DM을 보내요</div></div>
+    <label class="switch" style="margin:0"><input type="checkbox" name="follow_required" id="f-follow"><span></span></label>
+  </div>
+  <div id="gate-fields" class="gate" hidden>
+    <label>① 첫 DM <span class="muted">(팔로우 + 답장 요청 · 비우면 기본 문구)</span></label>
+    <textarea name="follow_prompt" placeholder="댓글 고마워요! 🙌 팔로우하고 이 메시지에 '완료'라고 답장 주시면 바로 보내드릴게요."></textarea>
+    <label>답장했는데 아직 팔로우 안 했을 때 <span class="muted">(비우면 기본 문구 · 최대 3번)</span></label>
+    <textarea name="not_following_msg" placeholder="아직 팔로우가 확인되지 않아요 🥲 팔로우하고 다시 답장 주시면 바로 보내드릴게요!"></textarea>
+    <div class="hint">답장 내용은 아무거나 괜찮아요. 답장이 오면 1분 안에 팔로우 여부를 확인해요.</div>
+  </div>
+
+  <label><span id="dm-label">보낼 DM</span> <span class="muted" id="dm-count">0 / 1000</span></label>
   <textarea name="dm_message" required placeholder="댓글 남겨주셔서 감사해요! 요청하신 링크 보내드려요 👉 https://everywherelucas.com"></textarea>
 
   <label>공개 답글 <span class="muted">(선택 · 한 줄에 하나, 랜덤으로 달아요)</span></label>
@@ -211,6 +227,7 @@ async function loadRules() {
       .map((k) => '<span class="chip">' + esc(k) + '</span>').join("");
     return '<div class="rule">' + thumb +
       '<div><div class="row" style="justify-content:flex-start;gap:8px"><b>' + esc(r.name || "이름 없는 규칙") + '</b>' +
+      (r.follow_required ? '<span class="tag">팔로우 필수</span>' : '') +
       '<span class="muted">@' + esc(r.username || "?") + ' · ' + (r.match_type === "exact" ? "정확히 일치" : "포함") + ' · ' + r.sent_count + '건 발송</span></div>' +
       '<div class="chips">' + kws + '</div><div class="dm">💬 ' + esc(r.dm_message) + '</div></div>' +
       '<div class="actions row" style="gap:6px;flex-wrap:nowrap">' +
@@ -225,7 +242,7 @@ async function loadLogs() {
   $("#s-today").textContent = d.stats?.today || 0;
   $("#s-total").textContent = d.stats?.total || 0;
   $("#s-fail").textContent = d.stats?.failed_today || 0;
-  const label = { sent: "발송", failed: "실패", pending: "처리중" };
+  const label = { sent: "발송", failed: "실패", pending: "처리중", awaiting: "팔로우 대기" };
   $("#logs").innerHTML = d.logs.length ? d.logs.map((l) =>
     '<div class="log"><span class="st ' + esc(l.status) + '">' + (label[l.status] || esc(l.status)) + '</span>' +
     '<div><b>@' + esc(l.commenter_username) + '</b> <span class="muted">"' + esc(l.comment_text) + '"</span>' +
@@ -253,10 +270,12 @@ function openForm(rule) {
     f.ig_user_id.value = rule.ig_user_id; f.name.value = rule.name || ""; f.keywords.value = rule.keywords;
     f.dm_message.value = rule.dm_message; f.public_reply.value = rule.public_reply || "";
     f.querySelector('[name=match_type][value=' + rule.match_type + ']').checked = true;
+    f.follow_required.checked = !!rule.follow_required;
+    f.follow_prompt.value = rule.follow_prompt || ""; f.not_following_msg.value = rule.not_following_msg || "";
     f.querySelector('[name=scope][value=' + (rule.media_id ? "one" : "all") + ']').checked = true;
   }
   $("#dm-count").textContent = f.dm_message.value.length + " / 1000";
-  state.media = null; syncScope();
+  syncFollow(); state.media = null; syncScope();
   dlg.showModal();
 }
 async function syncScope() {
@@ -276,7 +295,13 @@ async function syncScope() {
   $("#media-hint").textContent = state.picked ? "선택됨 ✓" : "DM을 걸 게시물을 고르세요 (최근 24개)";
 }
 
+function syncFollow() {
+  const on = f.follow_required.checked;
+  $("#gate-fields").hidden = !on;
+  $("#dm-label").textContent = on ? "② 팔로우 확인 후 보낼 DM" : "보낼 DM";
+}
 f.addEventListener("change", (e) => {
+  if (e.target.name === "follow_required") syncFollow();
   if (e.target.name === "scope") syncScope();
   if (e.target.name === "ig_user_id") { state.media = null; state.picked = null; syncScope(); }
 });
@@ -295,6 +320,7 @@ f.addEventListener("submit", async (e) => {
   const body = {
     ig_user_id: f.ig_user_id.value, name: f.name.value, keywords: f.keywords.value,
     match_type: f.match_type.value, dm_message: f.dm_message.value, public_reply: f.public_reply.value,
+    follow_required: f.follow_required.checked, follow_prompt: f.follow_prompt.value, not_following_msg: f.not_following_msg.value,
     media_id: one ? state.picked.id : null, media_permalink: one ? state.picked.permalink : null,
     media_thumb: one ? state.picked.thumb : null, active: state.editing ? !!state.editing.active : true,
   };
@@ -328,8 +354,9 @@ $("#poll-now").onclick = async () => {
   try {
     const d = await call("/api/poll", { method: "POST" });
     const sent = d.result.reduce((n, r) => n + (r.sent || 0), 0);
-    const errs = d.result.filter((r) => r.error).map((r) => r.error);
-    toast(errs.length ? "오류: " + errs[0] : "확인 완료 · 새로 보낸 DM " + sent + "건");
+    const unlocked = (d.replies || []).reduce((n, r) => n + (r.unlocked || 0), 0);
+    const errs = d.result.concat(d.replies || []).filter((r) => r.error).map((r) => r.error);
+    toast(errs.length ? "오류: " + errs[0] : "확인 완료 · 새 DM " + sent + "건" + (unlocked ? " · 팔로우 확인 후 발송 " + unlocked + "건" : ""));
     loadLogs();
   } catch (err) { toast(err.message); }
   b.disabled = false; b.textContent = "지금 댓글 확인";
