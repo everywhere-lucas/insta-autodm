@@ -6,10 +6,10 @@ compatibility_date = "2026-10-01"
 [triggers]
 crons = ["* * * * *"]
 
+# database_id 는 비워두면 첫 배포 때 Cloudflare가 자동으로 만들어 연결합니다
 [[d1_databases]]
 binding = "DB"
 database_name = "insta-autodm"
-database_id = "여기에_D1_데이터베이스_ID_붙여넣기"
 
 [vars]
 # Meta 앱 > Instagram > API setup with Instagram login 화면의 "Instagram app ID"
