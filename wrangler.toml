@@ -2,9 +2,11 @@ name = "insta-autodm"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
 
-# 1분마다 실행: 새 댓글 확인(폴링) + 토큰 자동 갱신
+# 1분마다 2가지 실행 (무료 플랜 요청 한도를 각각 따로 쓰려고 나눔)
+#  "* * * * *"    → 새 댓글 확인
+#  "0-59 * * * *" → 팔로우 확인 답장 확인 + 토큰 자동 갱신
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "0-59 * * * *"]
 
 # database_id 는 비워두면 첫 배포 때 Cloudflare가 자동으로 만들어 연결합니다
 [[d1_databases]]

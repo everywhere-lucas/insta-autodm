@@ -1,19 +1,27 @@
 import * as ig from "./instagram.js";
 import {
-  pollAll, handleWebhookPayload, verifySignature, refreshExpiringTokens,
+  pollAll, pollRepliesAll, withBudget, handleWebhookPayload, verifySignature, refreshExpiringTokens,
 } from "./engine.js";
 import { dashboardHtml, privacyHtml } from "./pages.js";
-import { SCHEMA } from "./schema.js";
+import { SCHEMA, MIGRATIONS } from "./schema.js";
 
-// 처음 켜질 때 한 번 테이블 생성 (이미 있으면 아무것도 안 함)
+// 켜질 때 한 번: 테이블 생성 + 새 칸 추가 (이미 있으면 아무것도 안 함)
 let schemaReady = null;
 function ensureSchema(env) {
-  schemaReady ??= env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s))).catch((e) => {
+  schemaReady ??= (async () => {
+    await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
+    for (const m of MIGRATIONS) {
+      try { await env.DB.prepare(m).run(); } catch { /* 이미 있는 칸 */ }
+    }
+  })().catch((e) => {
     schemaReady = null;
     throw e;
   });
   return schemaReady;
 }
+
+// 크론 2개: 하나는 새 댓글 확인, 하나는 팔로우 답장 확인 (각각 요청 한도 따로)
+const CRON_REPLIES = "0-59 * * * *";
 
 export default {
   async fetch(request, env, ctx) {
@@ -48,8 +56,12 @@ export default {
 
   async scheduled(event, env, ctx) {
     await ensureSchema(env);
-    if (env.MODE !== "webhook") ctx.waitUntil(pollAll(env));
-    ctx.waitUntil(refreshExpiringTokens(env));
+    if (event.cron === CRON_REPLIES) {
+      ctx.waitUntil(pollRepliesAll(withBudget(env)));
+      ctx.waitUntil(refreshExpiringTokens(env));
+    } else if (env.MODE !== "webhook") {
+      ctx.waitUntil(pollAll(withBudget(env)));
+    }
   },
 };
 
@@ -186,10 +198,11 @@ async function api(request, env, url, path) {
     const b = validateRule(await request.json());
     await getAccount(env, b.ig_user_id);
     const r = await env.DB.prepare(
-      `INSERT INTO rules (ig_user_id, name, media_id, media_permalink, media_thumb, keywords, match_type, dm_message, public_reply, active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+      `INSERT INTO rules (ig_user_id, name, media_id, media_permalink, media_thumb, keywords, match_type, dm_message, public_reply,
+         follow_required, follow_prompt, not_following_msg, active, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
     ).bind(b.ig_user_id, b.name, b.media_id, b.media_permalink, b.media_thumb, b.keywords,
-      b.match_type, b.dm_message, b.public_reply, ig.now()).run();
+      b.match_type, b.dm_message, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, ig.now()).run();
     return json({ ok: true, id: r.meta.last_row_id });
   }
 
@@ -198,9 +211,9 @@ async function api(request, env, url, path) {
     const b = validateRule(await request.json());
     await env.DB.prepare(
       `UPDATE rules SET name=?, media_id=?, media_permalink=?, media_thumb=?, keywords=?, match_type=?,
-       dm_message=?, public_reply=?, active=? WHERE id=?`
+       dm_message=?, public_reply=?, follow_required=?, follow_prompt=?, not_following_msg=?, active=? WHERE id=?`
     ).bind(b.name, b.media_id, b.media_permalink, b.media_thumb, b.keywords, b.match_type,
-      b.dm_message, b.public_reply, b.active, ruleMatch[1]).run();
+      b.dm_message, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, b.active, ruleMatch[1]).run();
     return json({ ok: true });
   }
   if (ruleMatch && m === "PATCH") {
@@ -223,7 +236,8 @@ async function api(request, env, url, path) {
       `SELECT
          SUM(CASE WHEN status='sent' AND created_at > ? THEN 1 ELSE 0 END) AS today,
          SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS total,
-         SUM(CASE WHEN status='failed' AND created_at > ? THEN 1 ELSE 0 END) AS failed_today
+         SUM(CASE WHEN status='failed' AND created_at > ? THEN 1 ELSE 0 END) AS failed_today,
+         SUM(CASE WHEN status='awaiting' THEN 1 ELSE 0 END) AS awaiting
        FROM logs`
     ).bind(since, since).first();
     return json({ logs: results, stats });
@@ -231,7 +245,9 @@ async function api(request, env, url, path) {
 
   // 지금 바로 댓글 확인 (테스트용)
   if (path === "/api/poll" && m === "POST") {
-    return json({ result: await pollAll(env) });
+    const comments = await pollAll(withBudget(env));
+    const replies = await pollRepliesAll(withBudget(env));
+    return json({ result: comments, replies });
   }
 
   return json({ error: "not found" }, 404);
@@ -249,11 +265,13 @@ function validateRule(b) {
     match_type: b.match_type === "exact" ? "exact" : "contains",
     dm_message: clean(b.dm_message, 1000),
     public_reply: clean(b.public_reply, 1000),
+    follow_required: b.follow_required ? 1 : 0,
+    follow_prompt: clean(b.follow_prompt, 1000),
+    not_following_msg: clean(b.not_following_msg, 1000),
     active: b.active === false || b.active === 0 ? 0 : 1,
   };
   if (!out.keywords) throw httpError("키워드를 입력하세요", 400);
-  if (!out.dm_message) throw httpError("DM 메시지를 입력하세요", 400);
-  return out;
+  if (!out.dm_message) throw httpError("DM 메시지를 입력하세요", 400);  return out;
 }
 
 async function getAccount(env, id) {
