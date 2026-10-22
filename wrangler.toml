@@ -1,0 +1,28 @@
+name = "insta-autodm"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# 1분마다 실행: 새 댓글 확인(폴링) + 토큰 자동 갱신
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "insta-autodm"
+database_id = "여기에_D1_데이터베이스_ID_붙여넣기"
+
+[vars]
+# Meta 앱 > Instagram > API setup with Instagram login 화면의 "Instagram app ID"
+IG_APP_ID = ""
+# 배포 후 주소 (끝에 / 없이). 예: https://insta-autodm.everywherelucas.workers.dev
+BASE_URL = ""
+# poll    = 1분마다 댓글 확인 (앱 심사 없이 사용 가능, 기본값)
+# webhook = 실시간 웹훅만 사용 (Advanced Access 심사 통과 후)
+# both    = 둘 다 (중복 발송은 자동 방지)
+MODE = "poll"
+API_VERSION = "v25.0"
+
+# 아래 3개는 비밀값이라 여기 적지 말고 명령어로 등록하세요 (README 참고)
+# npx wrangler secret put IG_APP_SECRET
+# npx wrangler secret put ADMIN_PASSWORD
+# npx wrangler secret put WEBHOOK_VERIFY_TOKEN
