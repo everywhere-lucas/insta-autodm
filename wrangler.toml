@@ -13,9 +13,9 @@ database_name = "insta-autodm"
 
 [vars]
 # Meta 앱 > Instagram > API setup with Instagram login 화면의 "Instagram app ID"
-IG_APP_ID = ""
+IG_APP_ID = "1362318169161353"
 # 배포 후 주소 (끝에 / 없이). 예: https://insta-autodm.everywherelucas.workers.dev
-BASE_URL = ""
+BASE_URL = "https://insta-autodm.lucashere-ytube.workers.dev"
 # poll    = 1분마다 댓글 확인 (앱 심사 없이 사용 가능, 기본값)
 # webhook = 실시간 웹훅만 사용 (Advanced Access 심사 통과 후)
 # both    = 둘 다 (중복 발송은 자동 방지)
