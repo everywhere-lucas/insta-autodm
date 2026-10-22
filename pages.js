@@ -72,6 +72,13 @@ h2{font-size:16px;font-weight:800;margin:0}
 .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding:12px 14px;border:1px solid var(--line);border-radius:12px}
 .toggle-row b{font-size:14px}
 .gate{border-left:3px solid var(--neon);padding-left:12px;margin-top:4px}
+.btn-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.6fr) auto;gap:6px;margin-top:6px}
+.btn-row input{min-width:0}
+.linkbtn{display:inline-block;font-size:12px;font-weight:600;border:1px solid var(--line);border-radius:8px;padding:3px 8px;margin:4px 4px 0 0;color:var(--blue-ink)}
+.dm-preview{background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:10px;margin-top:8px;max-width:300px}
+.dm-preview .bubble{white-space:pre-wrap;font-size:13px;line-height:1.45}
+.dm-preview .pbtn{display:block;text-align:center;font-size:13px;font-weight:600;padding:8px;border-top:1px solid var(--line);margin:8px -10px -2px;color:var(--blue-ink)}
+.dm-preview .pbtn+.pbtn{margin-top:0}
 .err{color:var(--bad);font-size:12px;margin-top:2px;word-break:break-all}
 dialog{border:0;border-radius:18px;padding:0;width:min(560px,calc(100vw - 24px));background:var(--card);color:var(--ink)}
 dialog::backdrop{background:rgba(5,10,30,.5)}
@@ -152,13 +159,18 @@ textarea{min-height:84px;resize:vertical}
     <div class="hint" id="media-hint">게시물을 불러오는 중…</div>
   </div>
 
-  <label>반응할 키워드 <span class="muted">(쉼표로 여러 개)</span></label>
-  <input type="text" name="keywords" placeholder="정보, 링크, info" required>
-  <div class="seg" style="margin-top:6px">
-    <label><input type="radio" name="match_type" value="contains" checked><span>포함되면</span></label>
+  <label>어떤 댓글에 반응?</label>
+  <div class="seg">
+    <label><input type="radio" name="match_type" value="contains" checked><span>키워드 포함</span></label>
     <label><input type="radio" name="match_type" value="exact"><span>정확히 일치</span></label>
+    <label><input type="radio" name="match_type" value="any"><span>모든 댓글</span></label>
   </div>
-  <div class="hint">대소문자·띄어쓰기·이모지는 무시해요. "포함되면"은 '정보 주세요🙏'도 '정보'로 잡아요.</div>
+  <div id="kw-wrap">
+    <label>키워드 <span class="muted">(쉼표로 여러 개)</span></label>
+    <input type="text" name="keywords" placeholder="정보, 링크, info">
+    <div class="hint">대소문자·띄어쓰기·이모지는 무시해요. "키워드 포함"은 '정보 주세요🙏'도 '정보'로 잡아요.</div>
+  </div>
+  <div class="hint" id="any-hint" hidden>키워드 없이 댓글을 단 모든 사람에게 보내요. 같은 사람에겐 한 번만 보내요.</div>
 
   <div class="toggle-row">
     <div><b>팔로우한 사람에게만 보내기</b><div class="hint" style="margin:2px 0 0">먼저 팔로우+답장을 요청하고, 팔로우가 확인되면 아래 DM을 보내요</div></div>
@@ -173,7 +185,13 @@ textarea{min-height:84px;resize:vertical}
   </div>
 
   <label><span id="dm-label">보낼 DM</span> <span class="muted" id="dm-count">0 / 1000</span></label>
-  <textarea name="dm_message" required placeholder="댓글 남겨주셔서 감사해요! 요청하신 링크 보내드려요 👉 https://everywherelucas.com"></textarea>
+  <textarea name="dm_message" required placeholder="댓글 남겨주셔서 감사해요! 아래 버튼 눌러서 확인해 보세요 👇"></textarea>
+
+  <label>링크 버튼 <span class="muted">(선택 · 최대 3개 · 버튼 이름 20자)</span></label>
+  <div id="btns"></div>
+  <button type="button" class="btn ghost sm" id="add-btn" style="margin-top:6px">+ 버튼 추가</button>
+  <div class="dm-preview" id="dm-preview" hidden><div class="bubble" id="pv-text"></div><div id="pv-btns"></div></div>
+  <div class="hint">버튼을 못 보내는 경우엔 자동으로 링크를 글자로 붙여서 보내요.</div>
 
   <label>공개 답글 <span class="muted">(선택 · 한 줄에 하나, 랜덤으로 달아요)</span></label>
   <textarea name="public_reply" placeholder="DM 보내드렸어요 📩&#10;확인해 보세요! 💌"></textarea>
@@ -223,13 +241,14 @@ async function loadRules() {
     const thumb = r.media_id
       ? (r.media_thumb ? '<img class="thumb" src="' + esc(r.media_thumb) + '" alt="">' : '<div class="thumb">게시물</div>')
       : '<div class="thumb">모든<br>게시물</div>';
-    const kws = r.keywords.split(/[,\\n]/).map((k) => k.trim()).filter(Boolean)
+    const kws = r.match_type === "any" ? '<span class="chip">모든 댓글</span>' : r.keywords.split(/[,\\n]/).map((k) => k.trim()).filter(Boolean)
       .map((k) => '<span class="chip">' + esc(k) + '</span>').join("");
     return '<div class="rule">' + thumb +
       '<div><div class="row" style="justify-content:flex-start;gap:8px"><b>' + esc(r.name || "이름 없는 규칙") + '</b>' +
       (r.follow_required ? '<span class="tag">팔로우 필수</span>' : '') +
-      '<span class="muted">@' + esc(r.username || "?") + ' · ' + (r.match_type === "exact" ? "정확히 일치" : "포함") + ' · ' + r.sent_count + '건 발송</span></div>' +
-      '<div class="chips">' + kws + '</div><div class="dm">💬 ' + esc(r.dm_message) + '</div></div>' +
+      '<span class="muted">@' + esc(r.username || "?") + ' · ' + (r.match_type === "exact" ? "정확히 일치" : r.match_type === "any" ? "모든 댓글" : "포함") + ' · ' + r.sent_count + '건 발송</span></div>' +
+      '<div class="chips">' + kws + '</div><div class="dm">💬 ' + esc(r.dm_message) + '</div>' +
+      btnList(r.buttons).map((b) => '<span class="linkbtn">🔗 ' + esc(b.title) + '</span>').join("") + '</div>' +
       '<div class="actions row" style="gap:6px;flex-wrap:nowrap">' +
       '<label class="switch" title="켜기/끄기"><input type="checkbox" data-toggle="' + r.id + '"' + (r.active ? " checked" : "") + '><span></span></label>' +
       '<button class="btn ghost sm" data-edit="' + r.id + '">수정</button>' +
@@ -257,6 +276,42 @@ async function refresh() {
   catch (e) { toast(e.message); }
 }
 
+function btnList(raw) {
+  if (Array.isArray(raw)) return raw;
+  try { const a = JSON.parse(raw || "[]"); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+
+// ---- 링크 버튼 입력 ----
+function btnRow(b = {}) {
+  const row = document.createElement("div");
+  row.className = "btn-row";
+  row.innerHTML = '<input type="text" class="b-title" maxlength="20" placeholder="버튼 이름 (예: 숙소 보기)">' +
+    '<input type="text" class="b-url" placeholder="https://...">' +
+    '<button type="button" class="btn danger sm b-del">삭제</button>';
+  row.querySelector(".b-title").value = b.title || "";
+  row.querySelector(".b-url").value = b.url || "";
+  $("#btns").appendChild(row);
+  syncBtns();
+}
+function readBtns() {
+  return [...document.querySelectorAll("#btns .btn-row")].map((r) => ({
+    title: r.querySelector(".b-title").value.trim(), url: r.querySelector(".b-url").value.trim(),
+  })).filter((b) => b.title || b.url);
+}
+function syncBtns() {
+  const n = document.querySelectorAll("#btns .btn-row").length;
+  $("#add-btn").hidden = n >= 3;
+  const list = readBtns();
+  const max = list.length ? 640 : 1000;
+  $("#dm-count").textContent = f.dm_message.value.length + " / " + max;
+  $("#dm-preview").hidden = !list.length;
+  $("#pv-text").textContent = f.dm_message.value || "DM 내용";
+  $("#pv-btns").innerHTML = list.map((b) => '<span class="pbtn">' + esc(b.title || "버튼") + '</span>').join("");
+}
+$("#add-btn").onclick = () => btnRow();
+$("#btns").addEventListener("click", (e) => { if (e.target.classList.contains("b-del")) { e.target.closest(".btn-row").remove(); syncBtns(); } });
+$("#btns").addEventListener("input", syncBtns);
+
 // ---- 규칙 폼 ----
 const f = $("#f"), dlg = $("#dlg");
 function openForm(rule) {
@@ -267,7 +322,7 @@ function openForm(rule) {
   $("#f-title").textContent = rule ? "규칙 수정" : "새 규칙";
   $("#f-acc").innerHTML = state.accounts.map((a) => '<option value="' + esc(a.ig_user_id) + '">@' + esc(a.username) + '</option>').join("");
   if (rule) {
-    f.ig_user_id.value = rule.ig_user_id; f.name.value = rule.name || ""; f.keywords.value = rule.keywords;
+    f.ig_user_id.value = rule.ig_user_id; f.name.value = rule.name || ""; f.keywords.value = rule.keywords === "*" ? "" : rule.keywords;
     f.dm_message.value = rule.dm_message; f.public_reply.value = rule.public_reply || "";
     f.querySelector('[name=match_type][value=' + rule.match_type + ']').checked = true;
     f.follow_required.checked = !!rule.follow_required;
@@ -275,7 +330,9 @@ function openForm(rule) {
     f.querySelector('[name=scope][value=' + (rule.media_id ? "one" : "all") + ']').checked = true;
   }
   $("#dm-count").textContent = f.dm_message.value.length + " / 1000";
-  syncFollow(); state.media = null; syncScope();
+  $("#btns").innerHTML = "";
+  btnList(rule && rule.buttons).forEach((b) => btnRow(b));
+  syncBtns(); syncFollow(); syncMatch(); state.media = null; syncScope();
   dlg.showModal();
 }
 async function syncScope() {
@@ -295,6 +352,10 @@ async function syncScope() {
   $("#media-hint").textContent = state.picked ? "선택됨 ✓" : "DM을 걸 게시물을 고르세요 (최근 24개)";
 }
 
+function syncMatch() {
+  const any = f.match_type.value === "any";
+  $("#kw-wrap").hidden = any; $("#any-hint").hidden = !any;
+}
 function syncFollow() {
   const on = f.follow_required.checked;
   $("#gate-fields").hidden = !on;
@@ -302,10 +363,11 @@ function syncFollow() {
 }
 f.addEventListener("change", (e) => {
   if (e.target.name === "follow_required") syncFollow();
+  if (e.target.name === "match_type") syncMatch();
   if (e.target.name === "scope") syncScope();
   if (e.target.name === "ig_user_id") { state.media = null; state.picked = null; syncScope(); }
 });
-f.dm_message.addEventListener("input", () => ($("#dm-count").textContent = f.dm_message.value.length + " / 1000"));
+f.dm_message.addEventListener("input", syncBtns);
 $("#media").addEventListener("click", (e) => {
   const b = e.target.closest("[data-media]"); if (!b) return;
   const m = state.media.find((x) => x.id === b.dataset.media);
@@ -317,9 +379,11 @@ f.addEventListener("submit", async (e) => {
   e.preventDefault();
   const one = f.scope.value === "one";
   if (one && !state.picked) return toast("게시물을 선택하세요");
+  if (f.match_type.value !== "any" && !f.keywords.value.trim()) return toast("키워드를 입력하세요");
   const body = {
     ig_user_id: f.ig_user_id.value, name: f.name.value, keywords: f.keywords.value,
     match_type: f.match_type.value, dm_message: f.dm_message.value, public_reply: f.public_reply.value,
+    buttons: readBtns(),
     follow_required: f.follow_required.checked, follow_prompt: f.follow_prompt.value, not_following_msg: f.not_following_msg.value,
     media_id: one ? state.picked.id : null, media_permalink: one ? state.picked.permalink : null,
     media_thumb: one ? state.picked.thumb : null, active: state.editing ? !!state.editing.active : true,
