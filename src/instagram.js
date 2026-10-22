@@ -121,12 +121,33 @@ export async function listComments(env, token, mediaId, limit = 50) {
 
 // ---------- 쓰기 ----------
 
+// 메시지 본문: 버튼이 있으면 버튼 템플릿(텍스트 640자 + 링크 버튼 최대 3개)
+export function buildMessage(text, buttons) {
+  if (!buttons?.length) return { text };
+  return {
+    attachment: {
+      type: "template",
+      payload: {
+        template_type: "button",
+        text: text.slice(0, 640),
+        buttons: buttons.slice(0, 3).map((b) => ({ type: "web_url", url: b.url, title: b.title })),
+      },
+    },
+  };
+}
+
+// 버튼을 못 쓰는 경우 대비: 링크를 글자로 붙인 버전
+export function textWithLinks(text, buttons) {
+  if (!buttons?.length) return text;
+  return text + "\n\n" + buttons.map((b) => `👉 ${b.title}\n${b.url}`).join("\n\n");
+}
+
 // 댓글 단 사람에게 DM (Private Reply). 댓글 1개당 1번, 댓글 후 7일 이내만 가능.
-export function sendPrivateReply(env, token, igUserId, commentId, text) {
+export function sendPrivateReply(env, token, igUserId, commentId, text, buttons) {
   return igFetch(`${GRAPH}/${v(env)}/${igUserId}/messages`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { comment_id: commentId }, message: { text } }),
+    body: JSON.stringify({ recipient: { comment_id: commentId }, message: buildMessage(text, buttons) }),
   }, env);
 }
 
@@ -137,6 +158,15 @@ export function replyToComment(env, token, commentId, text) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ message: text }),
   }, env);
+}
+
+// ---------- 진단용 ----------
+export async function rawGet(env, token, path) {
+  try {
+    return { ok: true, data: await igFetch(`${GRAPH}/${v(env)}/${path}`, auth(token), env) };
+  } catch (e) {
+    return { ok: false, status: e.status, error: e.message, body: e.body };
+  }
 }
 
 // ---------- 팔로우 확인용 (대화) ----------
@@ -175,11 +205,11 @@ export function getFollowStatus(env, token, igsid) {
 }
 
 // 일반 DM (상대가 답장한 뒤 24시간 안에만 가능)
-export function sendDirect(env, token, igUserId, igsid, text) {
+export function sendDirect(env, token, igUserId, igsid, text, buttons) {
   return igFetch(`${GRAPH}/${v(env)}/${igUserId}/messages`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { id: igsid }, message: { text } }),
+    body: JSON.stringify({ recipient: { id: igsid }, message: buildMessage(text, buttons) }),
   }, env);
 }
 

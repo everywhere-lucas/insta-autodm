@@ -1,6 +1,6 @@
 import * as ig from "./instagram.js";
 import {
-  pollAll, pollRepliesAll, withBudget, handleWebhookPayload, verifySignature, refreshExpiringTokens,
+  pollAll, pollRounds, pollRepliesAll, withBudget, handleWebhookPayload, verifySignature, refreshExpiringTokens,
 } from "./engine.js";
 import { dashboardHtml, privacyHtml } from "./pages.js";
 import { SCHEMA, MIGRATIONS } from "./schema.js";
@@ -60,7 +60,7 @@ export default {
       ctx.waitUntil(pollRepliesAll(withBudget(env)));
       ctx.waitUntil(refreshExpiringTokens(env));
     } else if (env.MODE !== "webhook") {
-      ctx.waitUntil(pollAll(withBudget(env)));
+      ctx.waitUntil(pollRounds(env)); // 0초·20초·40초 3번 확인
     }
   },
 };
@@ -198,11 +198,11 @@ async function api(request, env, url, path) {
     const b = validateRule(await request.json());
     await getAccount(env, b.ig_user_id);
     const r = await env.DB.prepare(
-      `INSERT INTO rules (ig_user_id, name, media_id, media_permalink, media_thumb, keywords, match_type, dm_message, public_reply,
+      `INSERT INTO rules (ig_user_id, name, media_id, media_permalink, media_thumb, keywords, match_type, dm_message, buttons, public_reply,
          follow_required, follow_prompt, not_following_msg, active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
     ).bind(b.ig_user_id, b.name, b.media_id, b.media_permalink, b.media_thumb, b.keywords,
-      b.match_type, b.dm_message, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, ig.now()).run();
+      b.match_type, b.dm_message, b.buttons, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, ig.now()).run();
     return json({ ok: true, id: r.meta.last_row_id });
   }
 
@@ -211,9 +211,9 @@ async function api(request, env, url, path) {
     const b = validateRule(await request.json());
     await env.DB.prepare(
       `UPDATE rules SET name=?, media_id=?, media_permalink=?, media_thumb=?, keywords=?, match_type=?,
-       dm_message=?, public_reply=?, follow_required=?, follow_prompt=?, not_following_msg=?, active=? WHERE id=?`
+       dm_message=?, buttons=?, public_reply=?, follow_required=?, follow_prompt=?, not_following_msg=?, active=? WHERE id=?`
     ).bind(b.name, b.media_id, b.media_permalink, b.media_thumb, b.keywords, b.match_type,
-      b.dm_message, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, b.active, ruleMatch[1]).run();
+      b.dm_message, b.buttons, b.public_reply, b.follow_required, b.follow_prompt, b.not_following_msg, b.active, ruleMatch[1]).run();
     return json({ ok: true });
   }
   if (ruleMatch && m === "PATCH") {
@@ -243,6 +243,24 @@ async function api(request, env, url, path) {
     return json({ logs: results, stats });
   }
 
+  // 진단: 규칙 걸린 게시물에서 인스타가 실제로 뭘 돌려주는지
+  if (path === "/api/debug" && m === "GET") {
+    const { results: accounts } = await env.DB.prepare("SELECT * FROM accounts").all();
+    const report = [];
+    for (const a of accounts) {
+      const { results: rs } = await env.DB.prepare("SELECT DISTINCT media_id FROM rules WHERE ig_user_id=? AND media_id IS NOT NULL").bind(a.ig_user_id).all();
+      const media = [];
+      for (const r of rs.slice(0, 3)) {
+        const info = await ig.rawGet(env, a.access_token, `${r.media_id}?fields=id,comments_count,permalink`);
+        const plain = await ig.rawGet(env, a.access_token, `${r.media_id}/comments?fields=id,text,timestamp&limit=5`);
+        const full = await ig.rawGet(env, a.access_token, `${r.media_id}/comments?fields=id,text,timestamp,username,from&limit=5`);
+        media.push({ media_id: r.media_id, info, comments_basic: plain, comments_full: full });
+      }
+      report.push({ account: a.username, me: await ig.rawGet(env, a.access_token, "me?fields=user_id,username,account_type"), media });
+    }
+    return json({ report });
+  }
+
   // 지금 바로 댓글 확인 (테스트용)
   if (path === "/api/poll" && m === "POST") {
     const comments = await pollAll(withBudget(env));
@@ -251,6 +269,24 @@ async function api(request, env, url, path) {
   }
 
   return json({ error: "not found" }, 404);
+}
+
+// 링크 버튼: 최대 3개, 이름 20자, https 주소만
+function cleanButtons(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const raw of list) {
+    const title = String(raw?.title || "").trim();
+    let url = String(raw?.url || "").trim();
+    if (!title && !url) continue;
+    if (!title) throw httpError("버튼 이름을 입력하세요", 400);
+    if (title.length > 20) throw httpError(`버튼 이름은 20자까지예요: "${title}"`, 400);
+    if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
+    try { new URL(url); } catch { throw httpError(`버튼 주소가 올바르지 않아요: "${raw.url}"`, 400); }
+    out.push({ title, url });
+  }
+  if (out.length > 3) throw httpError("버튼은 최대 3개까지예요", 400);
+  return out.length ? JSON.stringify(out) : null;
 }
 
 function validateRule(b) {
@@ -262,14 +298,17 @@ function validateRule(b) {
     media_permalink: clean(b.media_permalink, 300),
     media_thumb: clean(b.media_thumb, 1000),
     keywords: clean(b.keywords, 300),
-    match_type: b.match_type === "exact" ? "exact" : "contains",
+    match_type: ["exact", "any"].includes(b.match_type) ? b.match_type : "contains",
     dm_message: clean(b.dm_message, 1000),
+    buttons: cleanButtons(b.buttons),
     public_reply: clean(b.public_reply, 1000),
     follow_required: b.follow_required ? 1 : 0,
     follow_prompt: clean(b.follow_prompt, 1000),
     not_following_msg: clean(b.not_following_msg, 1000),
     active: b.active === false || b.active === 0 ? 0 : 1,
   };
+  if (out.match_type === "any") out.keywords = out.keywords || "*";
+  if (out.buttons && out.dm_message && out.dm_message.length > 640) throw httpError("버튼을 쓸 땐 DM 내용이 640자까지예요", 400);
   if (!out.keywords) throw httpError("키워드를 입력하세요", 400);
   if (!out.dm_message) throw httpError("DM 메시지를 입력하세요", 400);  return out;
 }
